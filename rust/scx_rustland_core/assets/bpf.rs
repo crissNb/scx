@@ -488,6 +488,12 @@ impl<'cb> BpfScheduler<'cb> {
         &mut self.skel.maps.bss_data.nr_sched_congested
     }
 
+    // Per-CPU scheduled tasks count array.
+    #[allow(dead_code)]
+    pub fn nr_scheduled_per_cpu_mut(&mut self) -> &mut [u64] {
+        &mut self.skel.maps.bss_data.nr_scheduled_per_cpu
+    }
+
     // Set scheduling class for the scheduler itself to SCHED_EXT
     fn use_sched_ext() -> i32 {
         #[cfg(target_env = "gnu")]

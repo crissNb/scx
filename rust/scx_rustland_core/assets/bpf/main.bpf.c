@@ -101,6 +101,9 @@ volatile u64 nr_user_dispatches, nr_kernel_dispatches,
 /* Failure statistics */
 volatile u64 nr_failed_dispatches, nr_sched_congested;
 
+/* Per-CPU scheduled tasks count */
+volatile u64 nr_scheduled_per_cpu[MAX_CPUS];
+
  /* Report additional debugging information */
 const volatile bool debug;
 
@@ -379,6 +382,21 @@ static u64 cpu_to_dsq(s32 cpu)
 }
 
 /*
+ * Update the per-CPU scheduled tasks count by querying the number of tasks
+ * in the local DSQ for each CPU.
+ */
+static void update_scheduled_tasks_per_cpu(void)
+{
+	s32 cpu;
+
+	bpf_for(cpu, 0, nr_cpu_ids) {
+		if (cpu >= MAX_CPUS)
+			break;
+		nr_scheduled_per_cpu[cpu] = scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu));
+	}
+}
+
+/*
  * Find an idle CPU in the system for the task.
  *
  * NOTE: the idle CPU selection doesn't need to be formally perfect, it is
@@ -622,6 +640,9 @@ static void dispatch_task(const struct dispatched_task_ctx *task)
 	scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(task->cpu),
 				 task->slice_ns, task->vtime, task->flags);
 	__sync_fetch_and_add(&nr_user_dispatches, 1);
+	if (task->cpu >= 0 && task->cpu < MAX_CPUS) {
+		__sync_fetch_and_add(&nr_scheduled_per_cpu[task->cpu], 1);
+	}
 
 	/*
 	 * If the cpumask is not valid anymore, ignore the dispatch event.
@@ -715,6 +736,10 @@ static s32 try_direct_dispatch(struct task_struct *p,
 		scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(cpu),
 					 SCX_SLICE_DFL, p->scx.dsq_vtime, enq_flags);
 		__sync_fetch_and_add(&nr_kernel_dispatches, 1);
+		// Atomically increment the counter with a bounds check for the verifier
+		if (cpu >= 0 && cpu < MAX_CPUS) {
+			__sync_fetch_and_add(&nr_scheduled_per_cpu[cpu], 1);
+		}
 		*dispatched = true;
 	}
 
@@ -836,6 +861,9 @@ void BPF_STRUCT_OPS(rustland_enqueue, struct task_struct *p, u64 enq_flags)
                 scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(cpu),
 					 SCX_SLICE_DFL, p->scx.dsq_vtime, enq_flags);
 		__sync_fetch_and_add(&nr_kernel_dispatches, 1);
+		if (cpu >= 0 && cpu < MAX_CPUS) {
+			__sync_fetch_and_add(&nr_scheduled_per_cpu[cpu], 1);
+		}
 		return;
 	}
 
@@ -951,8 +979,12 @@ void BPF_STRUCT_OPS(rustland_dispatch, s32 cpu, struct task_struct *prev)
 	/*
 	 * Consume a task from the per-CPU DSQ.
 	 */
-	if (scx_bpf_dsq_move_to_local(cpu_to_dsq(cpu)))
+	if (scx_bpf_dsq_move_to_local(cpu_to_dsq(cpu))) {
+		if (cpu >= 0 && cpu < MAX_CPUS) {
+			__sync_fetch_and_sub(&nr_scheduled_per_cpu[cpu], 1);
+		}
 		return;
+	}
 
 	/*
 	 * Consume a task from the shared DSQ.
@@ -975,6 +1007,9 @@ void BPF_STRUCT_OPS(rustland_dispatch, s32 cpu, struct task_struct *prev)
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 		return;
 	}
+
+	// Also periodically ensure scheduled tasks is up to date, prevent drifting
+	update_scheduled_tasks_per_cpu();
 
 	/*
 	 * If the current task expired its time slice and no other task
@@ -1326,6 +1361,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(rustland_init)
 	err = usersched_timer_init();
 	if (err)
 		return err;
+
+	/* Initialize per-CPU scheduled tasks count */
+	update_scheduled_tasks_per_cpu();
 
 	return 0;
 }
