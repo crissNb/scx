@@ -230,6 +230,11 @@ struct task_ctx {
 	 * Execution time (in nanoseconds) since the last sleep event.
 	 */
 	u64 exec_runtime;
+
+	/*
+	 * CPU this task was dispatched to (for tracking strict affinity violations)
+	 */
+	s32 dispatched_cpu;
 };
 
 /* Map that contains task-local storage. */
@@ -461,8 +466,9 @@ static void kick_task_cpu(const struct task_struct *p, s32 cpu)
  * Dispatch a task to a target per-CPU DSQ, waking up the corresponding CPU, if
  * needed.
  * 
- * HARDCODED: This function will ONLY dispatch to the exact CPU specified.
- * No fallback to SHARED_DSQ or idle CPU finding.
+ * STRICT CPU AFFINITY: This function will ONLY dispatch to the exact CPU specified.
+ * No fallback mechanisms. If the target CPU cannot accept the task, the dispatch
+ * will be cancelled to maintain strict CPU affinity.
  */
 static void dispatch_task(const struct dispatched_task_ctx *task)
 {
@@ -474,35 +480,36 @@ static void dispatch_task(const struct dispatched_task_ctx *task)
 		return;
 
 	/*
-	 * Handle RL_CPU_ANY case - still allow this for compatibility,
-	 * but dispatch to SHARED_DSQ without any idle CPU selection.
+	 * Handle RL_CPU_ANY case - dispatch to SHARED_DSQ where any allowed CPU can pick it up.
 	 */
 	if (task->cpu == RL_CPU_ANY) {
 		scx_bpf_dsq_insert_vtime(p, SHARED_DSQ,
 					 task->slice_ns, task->vtime, task->flags);
-		/* Don't kick any specific CPU for RL_CPU_ANY */
+		/* Don't kick any specific CPU for RL_CPU_ANY, let any allowed CPU pick it up */
 		goto out_release;
 	}
 
 	/*
-	 * Strict CPU validation: if the target CPU is not allowed or not valid
-	 * for this task, cancel the dispatch entirely. No fallback.
+	 * STRICT CPU VALIDATION: Ensure the target CPU is allowed and valid for this task.
+	 * If not, cancel the dispatch entirely to maintain strict CPU affinity.
 	 */
 	if (!is_cpu_allowed(task->cpu)) {
+		dbg_msg("dispatch_task: CPU %d not allowed for pid=%d, cancelling", task->cpu, task->pid);
 		scx_bpf_dispatch_cancel();
 		__sync_fetch_and_add(&nr_failed_dispatches, 1);
 		goto out_release;
 	}
 
 	if (!bpf_cpumask_test_cpu(task->cpu, p->cpus_ptr)) {
+		dbg_msg("dispatch_task: CPU %d not in cpumask for pid=%d, cancelling", task->cpu, task->pid);
 		scx_bpf_dispatch_cancel();
 		__sync_fetch_and_add(&nr_failed_dispatches, 1);
 		goto out_release;
 	}
 
 	/*
-	 * Dispatch task to the exact target CPU specified by the user-space
-	 * scheduler. No fallback mechanisms.
+	 * Dispatch task to the exact target CPU specified.
+	 * STRICT AFFINITY: No fallback mechanisms - task goes exactly where requested.
 	 */
 	scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(task->cpu),
 				 task->slice_ns, task->vtime, task->flags);
@@ -511,8 +518,16 @@ static void dispatch_task(const struct dispatched_task_ctx *task)
 		__sync_fetch_and_add(&nr_scheduled_per_cpu[task->cpu], 1);
 	}
 
+	/* Record which CPU this task was dispatched to for affinity tracking */
+	struct task_ctx *tctx = try_lookup_task_ctx(p);
+	if (tctx) {
+		tctx->dispatched_cpu = task->cpu;
+	}
+
 	/* Wake up the exact target CPU */
 	scx_bpf_kick_cpu(task->cpu, SCX_KICK_IDLE);
+
+	dbg_msg("dispatch_task: dispatched pid=%d to CPU %d", task->pid, task->cpu);
 
 out_release:
 	bpf_task_release(p);
@@ -747,9 +762,10 @@ void BPF_STRUCT_OPS(rustland_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	/*
-	 * Give the task a chance to be directly dispatched if
-	 * ops.select_cpu() was skipped.
+	 * DISABLE direct dispatch to ensure ALL tasks go through user-space scheduler.
+	 * This prevents any bypass that could cause CPU migration.
 	 */
+	/* Direct dispatch disabled for strict CPU affinity
 	if (builtin_idle && is_queued_wakeup(p, enq_flags)) {
 		bool dispatched = false;
 
@@ -759,6 +775,7 @@ void BPF_STRUCT_OPS(rustland_enqueue, struct task_struct *p, u64 enq_flags)
 			return;
 		}
 	}
+	*/
 
 	/*
 	 * Add tasks to the @queued list, they will be processed by the
@@ -835,9 +852,8 @@ static long handle_dispatched_task(struct bpf_dynptr *dynptr, void *context)
  * This function is called when a CPU's local DSQ is empty and ready to accept
  * new dispatched tasks.
  *
- * We may dispatch tasks also on other CPUs from here, if the scheduler decided
- * so (usually if other CPUs are idle we may want to send more tasks to their
- * local DSQ to optimize the scheduling pipeline).
+ * STRICT CPU AFFINITY: Each CPU only consumes tasks from its own per-CPU DSQ.
+ * Tasks dispatched to specific CPUs will ONLY run on those CPUs.
  */
 void BPF_STRUCT_OPS(rustland_dispatch, s32 cpu, struct task_struct *prev)
 {
@@ -863,8 +879,8 @@ void BPF_STRUCT_OPS(rustland_dispatch, s32 cpu, struct task_struct *prev)
 	bpf_user_ringbuf_drain(&dispatched, handle_dispatched_task, NULL, BPF_RB_NO_WAKEUP);
 
 	/*
-	 * Consume a task from the per-CPU DSQ first - this ensures tasks
-	 * dispatched to specific CPUs stay on those CPUs.
+	 * STRICT AFFINITY: Only consume tasks from this CPU's own DSQ.
+	 * This ensures tasks dispatched to specific CPUs stay on those CPUs.
 	 */
 	if (scx_bpf_dsq_move_to_local(cpu_to_dsq(cpu))) {
 		if (cpu >= 0 && cpu < MAX_CPUS) {
@@ -874,8 +890,8 @@ void BPF_STRUCT_OPS(rustland_dispatch, s32 cpu, struct task_struct *prev)
 	}
 
 	/*
-	 * Only consume from the shared DSQ - tasks dispatched with RL_CPU_ANY
-	 * go here and can be consumed by any CPU.
+	 * Only consume from the shared DSQ if dispatched with RL_CPU_ANY.
+	 * This allows flexibility for tasks that don't require strict CPU affinity.
 	 */
 	if (scx_bpf_dsq_move_to_local(SHARED_DSQ))
 		return;
@@ -935,8 +951,6 @@ void BPF_STRUCT_OPS(rustland_running, struct task_struct *p)
 		usersched_last_run_at = scx_bpf_now();
 		return;
 	}
-
-	dbg_msg("start: pid=%d (%s) cpu=%ld", p->pid, p->comm, cpu);
 
 	/*
 	 * Mark the CPU as busy by setting the pid as owner (ignoring the
@@ -1019,6 +1033,9 @@ s32 BPF_STRUCT_OPS(rustland_init_task, struct task_struct *p,
 				    BPF_LOCAL_STORAGE_GET_F_CREATE);
 	if (!tctx)
 		return -ENOMEM;
+
+	/* Initialize dispatched_cpu to -1 (no specific CPU assigned yet) */
+	tctx->dispatched_cpu = -1;
 
 	/*
 	 * Create task's L2 cache cpumask.
@@ -1291,6 +1308,7 @@ SCX_OPS_DEFINE(rustland,
 	       .init_task		= (void *)rustland_init_task,
 	       .init			= (void *)rustland_init,
 	       .exit			= (void *)rustland_exit,
+	       .flags			= SCX_OPS_ENQ_LAST,
 	       .timeout_ms		= 5000,
 	       .dispatch_max_batch	= MAX_DISPATCH_SLOT,
 	       .name			= "rustland");
