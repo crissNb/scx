@@ -24,6 +24,10 @@
  * able to simply modify the Rust component, without having to deal with any
  * internal kernel / BPF details.
  *
+ * MODIFIED: This version has been hardcoded to only use CPUs 0 and 20.
+ * All other CPUs will be ignored and tasks will only be dispatched to these
+ * two CPUs. This restriction is enforced throughout the scheduler.
+ *
  * This software may be used and distributed according to the terms of the
  * GNU General Public License version 2.
  */
@@ -291,6 +295,14 @@ static inline bool is_kthread(const struct task_struct *p)
 }
 
 /*
+ * Return true if the CPU is allowed by our hardcoded CPU mask (only CPUs 0 and 20).
+ */
+static inline bool is_cpu_allowed(s32 cpu)
+{
+	return cpu == 0 || cpu == 20;
+}
+
+/*
  * Return true if the target task @p is kswapd.
  */
 static inline bool is_kswapd(const struct task_struct *p)
@@ -392,6 +404,11 @@ static void update_scheduled_tasks_per_cpu(void)
 	bpf_for(cpu, 0, nr_cpu_ids) {
 		if (cpu >= MAX_CPUS)
 			break;
+		/* Only update counters for allowed CPUs */
+		if (!is_cpu_allowed(cpu)) {
+			nr_scheduled_per_cpu[cpu] = 0;
+			continue;
+		}
 		nr_scheduled_per_cpu[cpu] = scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu));
 	}
 }
@@ -415,11 +432,18 @@ static s32 pick_idle_cpu(const struct task_struct *p, s32 prev_cpu)
 	s32 cpu;
 
 	/*
+	 * Enforce hardcoded CPU restriction: only allow CPUs 0 and 20
+	 */
+	if (!is_cpu_allowed(prev_cpu)) {
+		prev_cpu = 0; /* Default to CPU 0 if prev_cpu is not allowed */
+	}
+
+	/*
 	 * For tasks that can run only on a single CPU, we can simply verify if
-	 * their only allowed CPU is still idle.
+	 * their only allowed CPU is still idle, but only if it's in our allowed set.
 	 */
 	if (p->nr_cpus_allowed == 1 || is_migration_disabled(p)) {
-		if (scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+		if (is_cpu_allowed(prev_cpu) && scx_bpf_test_and_clear_cpu_idle(prev_cpu))
 			return prev_cpu;
 
 		return -EBUSY;
@@ -480,86 +504,62 @@ static s32 pick_idle_cpu(const struct task_struct *p, s32 prev_cpu)
 
 	/*
 	 * Find the best idle CPU, prioritizing full idle cores in SMT systems.
+	 * But only consider our allowed CPUs (0 and 20).
 	 */
 	if (smt_enabled) {
 		/*
 		 * If the task can still run on the previously used CPU and
-		 * it's a full-idle core, keep using it.
+		 * it's a full-idle core, keep using it (only if allowed).
 		 */
-		if (bpf_cpumask_test_cpu(prev_cpu, idle_smtmask) &&
+		if (is_cpu_allowed(prev_cpu) && bpf_cpumask_test_cpu(prev_cpu, idle_smtmask) &&
 		    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
 			cpu = prev_cpu;
 			goto out_put_cpumask;
 		}
 
 		/*
-		 * Search for any full-idle CPU in the task domain that shares
-		 * the same L2 cache.
+		 * Try CPU 0 if it's idle and allowed
 		 */
-		if (l2_mask) {
-			cpu = scx_bpf_pick_idle_cpu(cast_mask(l2_mask), SCX_PICK_IDLE_CORE);
-			if (cpu >= 0)
-				goto out_put_cpumask;
-		}
-
-		/*
-		 * Search for any full-idle CPU in the task domain that shares
-		 * the same L3 cache.
-		 */
-		if (l3_mask) {
-			cpu = scx_bpf_pick_idle_cpu(cast_mask(l3_mask), SCX_PICK_IDLE_CORE);
-			if (cpu >= 0)
-				goto out_put_cpumask;
-		}
-
-		/*
-		 * Otherwise, search for another usable full-idle core.
-		 */
-		cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, SCX_PICK_IDLE_CORE);
-		if (cpu >= 0)
+		if (is_cpu_allowed(0) && bpf_cpumask_test_cpu(0, idle_smtmask) &&
+		    scx_bpf_test_and_clear_cpu_idle(0)) {
+			cpu = 0;
 			goto out_put_cpumask;
+		}
+
+		/*
+		 * Try CPU 20 if it's idle and allowed
+		 */
+		if (is_cpu_allowed(20) && bpf_cpumask_test_cpu(20, idle_smtmask) &&
+		    scx_bpf_test_and_clear_cpu_idle(20)) {
+			cpu = 20;
+			goto out_put_cpumask;
+		}
 	}
 
 	/*
 	 * If a full-idle core can't be found (or if this is not an SMT system)
-	 * try to re-use the same CPU, even if it's not in a full-idle core.
+	 * try to re-use the same CPU, even if it's not in a full-idle core (only if allowed).
 	 */
-	if (scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+	if (is_cpu_allowed(prev_cpu) && scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
 		cpu = prev_cpu;
 		goto out_put_cpumask;
 	}
 
 	/*
-	 * Search for any idle CPU in the primary domain that shares the same
-	 * L2 cache.
+	 * Try our allowed CPUs in order: 0, then 20
 	 */
-	if (l2_mask) {
-		cpu = scx_bpf_pick_idle_cpu(cast_mask(l2_mask), 0);
-		if (cpu >= 0)
-			goto out_put_cpumask;
-	}
-
-	/*
-	 * Search for any idle CPU in the primary domain that shares the same
-	 * L3 cache.
-	 */
-	if (l3_mask) {
-		cpu = scx_bpf_pick_idle_cpu(cast_mask(l3_mask), 0);
-		if (cpu >= 0)
-			goto out_put_cpumask;
-	}
-
-	/*
-	 * If all the previous attempts have failed, try to use any idle CPU in
-	 * the system.
-	 */
-	cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
-	if (cpu >= 0)
+	if (is_cpu_allowed(0) && scx_bpf_test_and_clear_cpu_idle(0)) {
+		cpu = 0;
 		goto out_put_cpumask;
+	}
+
+	if (is_cpu_allowed(20) && scx_bpf_test_and_clear_cpu_idle(20)) {
+		cpu = 20;
+		goto out_put_cpumask;
+	}
 
 	/*
-	 * If all the previous attempts have failed, dispatch the task to the
-	 * first CPU that will become available.
+	 * If no allowed CPU is available, return busy
 	 */
 	cpu = -EBUSY;
 
@@ -571,23 +571,33 @@ out_put_cpumask:
 
 /*
  * Wake-up a target @cpu for the dispatched task @p. If @cpu can't be used
- * wakeup another valid CPU.
+ * wakeup another valid CPU from our allowed set (0 or 20).
  */
 static void kick_task_cpu(const struct task_struct *p, s32 cpu)
 {
-	if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+	/* Enforce our CPU restriction */
+	if (!is_cpu_allowed(cpu)) {
+		cpu = 0; /* Default to CPU 0 */
+	}
+
+	if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr) || !is_cpu_allowed(cpu)) {
 		/*
 		 * Kick the target CPU anyway, since it may be locked and
 		 * needs to go back to idle to reset its state.
 		 */
-		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+		if (is_cpu_allowed(cpu))
+			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 
 		/*
-		 * Pick any other idle CPU that the task can use.
+		 * Pick from our allowed CPUs: try 0 first, then 20
 		 */
-		cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
-		if (cpu < 0)
-			return;
+		if (is_cpu_allowed(0) && bpf_cpumask_test_cpu(0, p->cpus_ptr)) {
+			cpu = 0;
+		} else if (is_cpu_allowed(20) && bpf_cpumask_test_cpu(20, p->cpus_ptr)) {
+			cpu = 20;
+		} else {
+			return; /* No allowed CPU available */
+		}
 	}
 	scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 }
@@ -609,11 +619,24 @@ static void dispatch_task(const struct dispatched_task_ctx *task)
 
 	/*
 	 * Dispatch task to the shared DSQ if the user-space scheduler
-	 * didn't select any specific target CPU.
+	 * didn't select any specific target CPU, but ensure we only use allowed CPUs.
 	 */
 	if (task->cpu == RL_CPU_ANY) {
 		scx_bpf_dsq_insert_vtime(p, SHARED_DSQ,
 					 task->slice_ns, task->vtime, task->flags);
+		kick_task_cpu(p, prev_cpu);
+
+		goto out_release;
+	}
+
+	/*
+	 * Enforce our CPU restriction: only allow CPUs 0 and 20
+	 */
+	if (!is_cpu_allowed(task->cpu)) {
+		/* Force dispatch to shared DSQ if target CPU is not allowed */
+		scx_bpf_dsq_insert_vtime(p, SHARED_DSQ,
+					 task->slice_ns, task->vtime, task->flags);
+		__sync_fetch_and_add(&nr_bounce_dispatches, 1);
 		kick_task_cpu(p, prev_cpu);
 
 		goto out_release;
@@ -645,7 +668,8 @@ static void dispatch_task(const struct dispatched_task_ctx *task)
 	}
 
 	/*
-	 * If the cpumask is not valid anymore, ignore the dispatch event.
+	 * If the cpumask is not valid anymore or CPU is not in our allowed set,
+	 * ignore the dispatch event.
 	 *
 	 * This can happen if the task has changed its affinity and the
 	 * target CPU has become invalid. In this case cancelling the
@@ -653,7 +677,7 @@ static void dispatch_task(const struct dispatched_task_ctx *task)
 	 * since the task will be re-enqueued by the core sched-ext code,
 	 * potentially selecting a different CPU.
 	 */
-	if (!bpf_cpumask_test_cpu(task->cpu, p->cpus_ptr)) {
+	if (!bpf_cpumask_test_cpu(task->cpu, p->cpus_ptr) || !is_cpu_allowed(task->cpu)) {
 		scx_bpf_dispatch_cancel();
 		__sync_fetch_and_add(&nr_cancel_dispatches, 1);
 
@@ -706,6 +730,13 @@ static s32 try_direct_dispatch(struct task_struct *p,
 		return cpu;
 
 	/*
+	 * Enforce our CPU restriction: only allow CPUs 0 and 20
+	 */
+	if (!is_cpu_allowed(cpu)) {
+		return -EBUSY;
+	}
+
+	/*
 	 * If we picked an invalid CPU for the task, give up and ignore
 	 * direct dispatch.
 	 */
@@ -723,7 +754,8 @@ static s32 try_direct_dispatch(struct task_struct *p,
 		 * task, refreshing its idle state and rejoining the pool
 		 * of idle CPUs.
 		 */
-		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+		if (is_cpu_allowed(cpu))
+			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 		return -EBUSY;
 	}
 
@@ -759,16 +791,27 @@ s32 BPF_STRUCT_OPS(rustland_select_cpu, struct task_struct *p, s32 prev_cpu,
 	if (is_usersched_task(p))
 		return prev_cpu;
 
+	/* Enforce our CPU restriction */
+	if (!is_cpu_allowed(prev_cpu)) {
+		prev_cpu = 0; /* Default to CPU 0 */
+	}
+
 	cpu = try_direct_dispatch(p, prev_cpu, 0, &dispatched);
-	if (cpu >= 0)
+	if (cpu >= 0 && is_cpu_allowed(cpu))
 		return cpu;
 
 	/*
-	 * If we couldn't find an idle CPU, in case of a sync wakeup
-	 * prioritize the waker's CPU.
+	 * If we couldn't find an allowed idle CPU, return an allowed CPU.
+	 * In case of a sync wakeup prioritize the waker's CPU if allowed.
 	 */
-	return is_wake_sync(wake_flags) ? bpf_get_smp_processor_id() : prev_cpu;
-
+	s32 waker_cpu = bpf_get_smp_processor_id();
+	if (is_wake_sync(wake_flags) && is_cpu_allowed(waker_cpu)) {
+		return waker_cpu;
+	} else if (is_cpu_allowed(prev_cpu)) {
+		return prev_cpu;
+	} else {
+		return 0; /* Default to CPU 0 */
+	}
 }
 
 /*
@@ -855,9 +898,18 @@ void BPF_STRUCT_OPS(rustland_enqueue, struct task_struct *p, u64 enq_flags)
 	 * This allows to prioritize critical kernel threads that may
 	 * potentially stall the entire system if they are blocked for too long
 	 * (i.e., ksoftirqd/N, rcuop/N, etc.).
+	 * 
+	 * However, enforce our CPU restriction: only allow CPUs 0 and 20.
 	 */
 	if ((is_kthread(p) && p->nr_cpus_allowed == 1) || is_kswapd(p) || is_khugepaged(p)) {
 		cpu = scx_bpf_task_cpu(p);
+		
+		/* Enforce CPU restriction for kernel threads */
+		if (!is_cpu_allowed(cpu)) {
+			/* Redirect to an allowed CPU, prefer CPU 0 */
+			cpu = 0;
+		}
+		
                 scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(cpu),
 					 SCX_SLICE_DFL, p->scx.dsq_vtime, enq_flags);
 		__sync_fetch_and_add(&nr_kernel_dispatches, 1);
@@ -962,6 +1014,13 @@ static long handle_dispatched_task(struct bpf_dynptr *dynptr, void *context)
  */
 void BPF_STRUCT_OPS(rustland_dispatch, s32 cpu, struct task_struct *prev)
 {
+	/*
+	 * Only dispatch on allowed CPUs (0 and 20). For disallowed CPUs,
+	 * just return and let them stay idle.
+	 */
+	if (!is_cpu_allowed(cpu))
+		return;
+
 	/*
 	 * Fire up the user-space scheduler: it will run only if no other
 	 * task needs to run.
@@ -1180,8 +1239,15 @@ static int usersched_timer_fn(void *map, int *key, struct bpf_timer *timer)
 
 			set_usersched_needed();
 			cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
-			if (cpu >= 0)
+			if (cpu >= 0 && is_cpu_allowed(cpu))
 				scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+			else {
+				/* Fallback to our allowed CPUs */
+				if (is_cpu_allowed(0))
+					scx_bpf_kick_cpu(0, SCX_KICK_IDLE);
+				else if (is_cpu_allowed(20))
+					scx_bpf_kick_cpu(20, SCX_KICK_IDLE);
+			}
 			bpf_task_release(p);
 		}
 		bpf_rcu_read_unlock();
@@ -1231,6 +1297,9 @@ static s32 get_nr_online_cpus(void)
 	bpf_for(i, 0, nr_cpu_ids) {
 		if (!bpf_cpumask_test_cpu(i, online_cpumask))
 			continue;
+		/* Only count allowed CPUs */
+		if (!is_cpu_allowed(i))
+			continue;
 		cpus++;
 	}
 
@@ -1256,8 +1325,12 @@ static int dsq_init(void)
 	/* Initialize amount of online CPUs */
 	nr_online_cpus = get_nr_online_cpus();
 
-	/* Create per-CPU DSQs */
+	/* Create per-CPU DSQs only for allowed CPUs (0 and 20) */
 	bpf_for(cpu, 0, nr_cpu_ids) {
+		/* Only create DSQs for our allowed CPUs */
+		if (!is_cpu_allowed(cpu))
+			continue;
+			
 		err = scx_bpf_create_dsq(cpu_to_dsq(cpu), -1);
 		if (err) {
 			scx_bpf_error("failed to create pcpu DSQ %d: %d",
