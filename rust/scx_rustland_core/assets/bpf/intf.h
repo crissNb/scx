@@ -43,7 +43,7 @@ typedef int pid_t;
  * Maximum amount of CPUs supported by this scheduler (this defines the size of
  * cpu_map that is used to store the idle state and CPU ownership).
  */
-#define MAX_CPUS 1024
+#define MAX_CPUS 24
 
 /* Special dispatch flags */
 enum {

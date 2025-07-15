@@ -1016,8 +1016,8 @@ void BPF_STRUCT_OPS(rustland_dispatch, s32 cpu, struct task_struct *prev)
 	 * wants to run, simply replenish its time slice and let it run for
 	 * another round on the same CPU.
 	 */
-	if (prev && is_queued(prev) && !is_usersched_task(prev))
-		prev->scx.slice = SCX_SLICE_DFL;
+	// if (prev && is_queued(prev) && !is_usersched_task(prev))
+	// 	prev->scx.slice = SCX_SLICE_DFL;
 }
 
 void BPF_STRUCT_OPS(rustland_runnable, struct task_struct *p, u64 enq_flags)
