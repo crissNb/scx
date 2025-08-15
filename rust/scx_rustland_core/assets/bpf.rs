@@ -33,7 +33,11 @@ use libc::{pthread_self, pthread_setschedparam, sched_param};
 #[cfg(target_env = "musl")]
 use libc::timespec;
 
+use anyhow::anyhow;
+use libbpf_rs::MapCore;
+use libbpf_rs::MapFlags;
 use scx_utils::compat;
+use scx_utils::perf;
 use scx_utils::scx_ops_attach;
 use scx_utils::scx_ops_load;
 use scx_utils::scx_ops_open;
@@ -84,6 +88,14 @@ pub struct QueuedTask {
     pub exec_runtime: u64,    // Total cpu time since last sleep
     pub weight: u64,          // Task static priority
     pub vtime: u64,           // Current vruntime
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct bpf_perf_event_value {
+    pub counter: u64,
+    pub enabled: u64,
+    pub running: u64,
 }
 
 // Task queued for dispatching to the BPF component (see bpf_intf::dispatched_task_ctx).
@@ -276,6 +288,67 @@ impl<'cb> BpfScheduler<'cb> {
         // Build the user ring buffer of dispatched tasks.
         let dispatched = libbpf_rs::UserRingBuffer::new(&maps.dispatched)
             .expect("failed to create user ringbuf");
+
+        // Attach BPF perf events
+        let n_cpus = 24;
+        for cpu in 0..(n_cpus as c_int) {
+            // Build perf_event_attr for instructions
+            let mut attr_instr = scx_utils::perf::bindings::perf_event_attr {
+                size: std::mem::size_of::<perf::bindings::perf_event_attr>() as u32,
+                ..Default::default()
+            };
+
+            attr_instr.type_ = perf::bindings::PERF_TYPE_HARDWARE;
+            attr_instr.config = perf::bindings::PERF_COUNT_HW_INSTRUCTIONS as u64;
+            attr_instr.set_disabled(0);
+            attr_instr.set_exclude_kernel(1);
+            attr_instr.set_exclude_hv(1);
+
+            // Open as per-cpu (-1 pid, cpu = cpu)
+            let fd_instr = unsafe { perf::perf_event_open(&mut attr_instr, -1, cpu, -1, 0) };
+            if fd_instr < 0 {
+                return Err(anyhow::anyhow!(
+                    "perf_event_open (instructions) failed for cpu {}: errno={}",
+                    cpu,
+                    -fd_instr
+                ));
+            }
+
+            // Build perf_event_attr for cycles
+            let mut attr_cycles = scx_utils::perf::bindings::perf_event_attr {
+                size: std::mem::size_of::<perf::bindings::perf_event_attr>() as u32,
+                ..Default::default()
+            };
+
+            attr_cycles.type_ = perf::bindings::PERF_TYPE_HARDWARE;
+            attr_cycles.config = perf::bindings::PERF_COUNT_HW_CPU_CYCLES as u64;
+            attr_cycles.set_disabled(0);
+            attr_cycles.set_exclude_kernel(1);
+            attr_cycles.set_exclude_hv(1);
+
+            let fd_cycles = unsafe { perf::perf_event_open(&mut attr_cycles, -1, cpu, -1, 0) };
+            if fd_cycles < 0 {
+                // close fd_instr before erroring out
+                unsafe {
+                    libc::close(fd_instr);
+                }
+                return Err(anyhow::anyhow!(
+                    "perf_event_open (cycles) failed for cpu {}: errno={}",
+                    cpu,
+                    -fd_cycles
+                ));
+            }
+
+            // Now publish the FDs into the BPF perf event arrays
+            skel.maps
+                .instr_events
+                .update(&cpu.to_ne_bytes(), &fd_instr.to_ne_bytes(), MapFlags::ANY)
+                .context("Failed to update instructions perf event map")?;
+            skel.maps
+                .cycles_events
+                .update(&cpu.to_ne_bytes(), &fd_cycles.to_ne_bytes(), MapFlags::ANY)
+                .context("Failed to update cycles perf event map")?;
+        }
 
         // Lock all the memory to prevent page faults that could trigger potential deadlocks during
         // scheduling.
@@ -492,6 +565,78 @@ impl<'cb> BpfScheduler<'cb> {
     #[allow(dead_code)]
     pub fn nr_running_per_cpu_mut(&mut self) -> &mut [u64] {
         &mut self.skel.maps.bss_data.nr_running_per_cpu
+    }
+
+    // Get IPC statistics for a specific PID.
+    pub fn get_ipc(&mut self, pid: i32) -> Result<f64> {
+        const MAX_SLICE_NS: u64 = 10_000_000;
+
+        let pid_key = (pid as u32).to_ne_bytes();
+
+        // Read accumulated time
+        let accumulated_time = match self
+            .skel
+            .maps
+            .accumulated_time
+            .lookup(&pid_key, MapFlags::ANY)?
+        {
+            Some(time_bytes) => u64::from_ne_bytes(
+                time_bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("Invalid accumulated_time value length"))?,
+            ),
+            None => {
+                return Ok(0.0);
+            }
+        };
+
+        println!("Accumulated time for PID {}: {}", pid, accumulated_time);
+
+        // Validate accumulated time is reasonable
+        if accumulated_time > MAX_SLICE_NS || accumulated_time < 1000 {
+            return Ok(0.0);
+        }
+
+        // Read cycles performance counter
+        let cycles = match self
+            .skel
+            .maps
+            .stored_cycles
+            .lookup(&pid_key, MapFlags::ANY)?
+        {
+            Some(cycles_bytes) => {
+                let perf_value: bpf_perf_event_value =
+                    unsafe { std::ptr::read(cycles_bytes.as_ptr() as *const bpf_perf_event_value) };
+                perf_value.counter
+            }
+            None => {
+                return Ok(0.0);
+            }
+        };
+
+        // Read instructions performance counter
+        let instructions = match self
+            .skel
+            .maps
+            .stored_instr
+            .lookup(&pid_key, MapFlags::ANY)?
+        {
+            Some(instr_bytes) => {
+                let perf_value: bpf_perf_event_value =
+                    unsafe { std::ptr::read(instr_bytes.as_ptr() as *const bpf_perf_event_value) };
+                perf_value.counter
+            }
+            None => {
+                return Ok(0.0);
+            }
+        };
+
+        if cycles == 0 || instructions == 0 {
+            return Ok(0.0);
+        }
+
+        Ok(instructions as f64 / cycles as f64)
     }
 
     // Set scheduling class for the scheduler itself to SCHED_EXT

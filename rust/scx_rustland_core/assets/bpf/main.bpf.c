@@ -62,10 +62,10 @@ UEI_DEFINE(uei);
 /*
  * Scheduler attributes and statistics.
  */
-const volatile u32 usersched_pid; /* User-space scheduler PID */
+const volatile u32 usersched_pid;  /* User-space scheduler PID */
 const volatile u32 khugepaged_pid; /* khugepaged PID */
-u64 usersched_last_run_at; /* Timestamp of the last user-space scheduler execution */
-static u64 nr_cpu_ids; /* Maximum possible CPU number */
+u64 usersched_last_run_at;		   /* Timestamp of the last user-space scheduler execution */
+static u64 nr_cpu_ids;			   /* Maximum possible CPU number */
 
 /*
  * Switch all tasks or SCHED_EXT tasks.
@@ -99,22 +99,24 @@ volatile u64 nr_running, nr_online_cpus;
 
 /* Dispatch statistics */
 volatile u64 nr_user_dispatches, nr_kernel_dispatches,
-	     nr_cancel_dispatches, nr_bounce_dispatches;
+	nr_cancel_dispatches, nr_bounce_dispatches;
 
 /* Failure statistics */
 volatile u64 nr_failed_dispatches, nr_sched_congested;
 
- /* Report additional debugging information */
+/* Report additional debugging information */
 const volatile bool debug;
 
 /* Rely on the in-kernel idle CPU selection policy */
 const volatile bool builtin_idle;
 
 /* Allow to use bpf_printk() only when @debug is set */
-#define dbg_msg(_fmt, ...) do {						\
-	if (debug)							\
-		bpf_printk(_fmt, ##__VA_ARGS__);			\
-} while(0)
+#define dbg_msg(_fmt, ...)                   \
+	do                                       \
+	{                                        \
+		if (debug)                           \
+			bpf_printk(_fmt, ##__VA_ARGS__); \
+	} while (0)
 
 /*
  * CPUs in the system have SMT is enabled.
@@ -158,10 +160,11 @@ static int calloc_cpumask(struct bpf_cpumask **p_cpumask)
  *
  * This map is drained by the user space scheduler.
  */
-struct {
+struct
+{
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, MAX_ENQUEUED_TASKS *
-				sizeof(struct queued_task_ctx));
+							sizeof(struct queued_task_ctx));
 } queued SEC(".maps");
 
 /*
@@ -170,21 +173,24 @@ struct {
  *
  * Drained by the kernel in .dispatch().
  */
-struct {
-        __uint(type, BPF_MAP_TYPE_USER_RINGBUF);
+struct
+{
+	__uint(type, BPF_MAP_TYPE_USER_RINGBUF);
 	__uint(max_entries, MAX_ENQUEUED_TASKS *
-				sizeof(struct dispatched_task_ctx));
+							sizeof(struct dispatched_task_ctx));
 } dispatched SEC(".maps");
 
 /*
  * Per-CPU context.
  */
-struct cpu_ctx {
+struct cpu_ctx
+{
 	struct bpf_cpumask __kptr *l2_cpumask;
 	struct bpf_cpumask __kptr *l3_cpumask;
 };
 
-struct {
+struct
+{
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, u32);
 	__type(value, struct cpu_ctx);
@@ -205,7 +211,8 @@ struct cpu_ctx *try_lookup_cpu_ctx(s32 cpu)
  *
  * This contain all the per-task information used internally by the BPF code.
  */
-struct task_ctx {
+struct task_ctx
+{
 	/*
 	 * Temporary cpumask for calculating scheduling domains.
 	 */
@@ -229,12 +236,97 @@ struct task_ctx {
 };
 
 /* Map that contains task-local storage. */
-struct {
+struct
+{
 	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__type(key, int);
 	__type(value, struct task_ctx);
 } task_ctx_stor SEC(".maps");
+
+/* perf-event array maps:
+ * Userspace must open perf events (instructions and cycles) and
+ * populate these maps with the FDs per-cpu.
+ */
+struct
+{
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(int));
+	__uint(value_size, sizeof(__u32));
+	__uint(max_entries, 0);
+} instr_events SEC(".maps");
+
+struct
+{
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(int));
+	__uint(value_size, sizeof(__u32));
+	__uint(max_entries, 0);
+} cycles_events SEC(".maps");
+
+/* Store the "start" snapshot for a PID (when it gets scheduled in).
+ * Key: pid (u32)
+ * Value: struct bpf_perf_event_value (one map for instr, one for cycles)
+ */
+struct
+{
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, __u32);
+	__type(value, struct bpf_perf_event_value);
+	__uint(max_entries, 10240);
+} prev_instr SEC(".maps");
+
+struct
+{
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, __u32);
+	__type(value, struct bpf_perf_event_value);
+	__uint(max_entries, 10240);
+} prev_cycles SEC(".maps");
+
+/* Store the "end" snapshot for a PID (when it gets scheduled out).
+ * Key: pid (u32)
+ * Value: struct bpf_perf_event_value
+ */
+struct
+{
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, __u32);
+	__type(value, struct bpf_perf_event_value);
+	__uint(max_entries, 10240);
+} stored_instr SEC(".maps");
+
+struct
+{
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, __u32);
+	__type(value, struct bpf_perf_event_value);
+	__uint(max_entries, 10240);
+} stored_cycles SEC(".maps");
+
+/* Store the "start" time for a PID (when it gets scheduled in).
+ * Key: pid (u32)
+ * Value: __u64 (timestamp)
+ */
+struct
+{
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, __u32);
+	__type(value, __u64);
+	__uint(max_entries, 10240);
+} prev_time SEC(".maps");
+
+/* Store the accumulated time for a PID.
+ * Key: pid (u32)
+ * Value: __u64 (accumulated time)
+ */
+struct
+{
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, __u32);
+	__type(value, __u64);
+	__uint(max_entries, 10240);
+} accumulated_time SEC(".maps");
 
 /*
  * Return a local task context from a generic task or NULL if the context
@@ -243,10 +335,10 @@ struct {
 struct task_ctx *try_lookup_task_ctx(const struct task_struct *p)
 {
 	struct task_ctx *tctx = bpf_task_storage_get(&task_ctx_stor,
-						(struct task_struct *)p, 0, 0);
+												 (struct task_struct *)p, 0, 0);
 	if (!tctx)
 		dbg_msg("warning: failed to get task context for pid=%d (%s)",
-			p->pid, p->comm);
+				p->pid, p->comm);
 	return tctx;
 }
 
@@ -257,11 +349,13 @@ struct task_ctx *try_lookup_task_ctx(const struct task_struct *p)
  * Without this timer we may starve the scheduler if the system is completely
  * idle and hit the watchdog that would auto-kill this scheduler.
  */
-struct usersched_timer {
+struct usersched_timer
+{
 	struct bpf_timer timer;
 };
 
-struct {
+struct
+{
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, u32);
@@ -295,7 +389,7 @@ static inline bool is_kthread(const struct task_struct *p)
  */
 static inline bool is_kswapd(const struct task_struct *p)
 {
-        return p->flags & (PF_KSWAPD | PF_KCOMPACTD);
+	return p->flags & (PF_KSWAPD | PF_KCOMPACTD);
 }
 
 /*
@@ -374,7 +468,8 @@ static bool usersched_has_pending_tasks(void)
  */
 static u64 cpu_to_dsq(s32 cpu)
 {
-	if (cpu < 0 || cpu >= MAX_CPUS) {
+	if (cpu < 0 || cpu >= MAX_CPUS)
+	{
 		scx_bpf_error("Invalid cpu: %d", cpu);
 		return SHARED_DSQ;
 	}
@@ -403,7 +498,8 @@ static s32 pick_idle_cpu(const struct task_struct *p, s32 prev_cpu)
 	 * For tasks that can run only on a single CPU, we can simply verify if
 	 * their only allowed CPU is still idle.
 	 */
-	if (p->nr_cpus_allowed == 1 || is_migration_disabled(p)) {
+	if (p->nr_cpus_allowed == 1 || is_migration_disabled(p))
+	{
 		if (scx_bpf_test_and_clear_cpu_idle(prev_cpu))
 			return prev_cpu;
 
@@ -434,10 +530,13 @@ static s32 pick_idle_cpu(const struct task_struct *p, s32 prev_cpu)
 	if (!l3_domain)
 		l3_domain = (struct bpf_cpumask *)p->cpus_ptr;
 
-	if (p->nr_cpus_allowed == nr_cpu_ids) {
+	if (p->nr_cpus_allowed == nr_cpu_ids)
+	{
 		l2_mask = l2_domain;
 		l3_mask = l3_domain;
-	} else {
+	}
+	else
+	{
 		/*
 		 * Determine the cache domain as the intersection of the
 		 * task's primary cpumask and the cache domain mask of the
@@ -445,7 +544,8 @@ static s32 pick_idle_cpu(const struct task_struct *p, s32 prev_cpu)
 		 * completely overlaps with the task's cpumask).
 		 */
 		l2_mask = tctx->l2_cpumask;
-		if (!l2_mask) {
+		if (!l2_mask)
+		{
 			scx_bpf_error("L2 cpumask not initialized");
 			cpu = -ENOENT;
 			goto out_put_cpumask;
@@ -454,7 +554,8 @@ static s32 pick_idle_cpu(const struct task_struct *p, s32 prev_cpu)
 			l2_mask = NULL;
 
 		l3_mask = tctx->l3_cpumask;
-		if (!l3_mask) {
+		if (!l3_mask)
+		{
 			scx_bpf_error("L3 cpumask not initialized");
 			cpu = -ENOENT;
 			goto out_put_cpumask;
@@ -466,13 +567,15 @@ static s32 pick_idle_cpu(const struct task_struct *p, s32 prev_cpu)
 	/*
 	 * Find the best idle CPU, prioritizing full idle cores in SMT systems.
 	 */
-	if (smt_enabled) {
+	if (smt_enabled)
+	{
 		/*
 		 * If the task can still run on the previously used CPU and
 		 * it's a full-idle core, keep using it.
 		 */
 		if (bpf_cpumask_test_cpu(prev_cpu, idle_smtmask) &&
-		    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+			scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+		{
 			cpu = prev_cpu;
 			goto out_put_cpumask;
 		}
@@ -481,7 +584,8 @@ static s32 pick_idle_cpu(const struct task_struct *p, s32 prev_cpu)
 		 * Search for any full-idle CPU in the task domain that shares
 		 * the same L2 cache.
 		 */
-		if (l2_mask) {
+		if (l2_mask)
+		{
 			cpu = scx_bpf_pick_idle_cpu(cast_mask(l2_mask), SCX_PICK_IDLE_CORE);
 			if (cpu >= 0)
 				goto out_put_cpumask;
@@ -491,7 +595,8 @@ static s32 pick_idle_cpu(const struct task_struct *p, s32 prev_cpu)
 		 * Search for any full-idle CPU in the task domain that shares
 		 * the same L3 cache.
 		 */
-		if (l3_mask) {
+		if (l3_mask)
+		{
 			cpu = scx_bpf_pick_idle_cpu(cast_mask(l3_mask), SCX_PICK_IDLE_CORE);
 			if (cpu >= 0)
 				goto out_put_cpumask;
@@ -509,7 +614,8 @@ static s32 pick_idle_cpu(const struct task_struct *p, s32 prev_cpu)
 	 * If a full-idle core can't be found (or if this is not an SMT system)
 	 * try to re-use the same CPU, even if it's not in a full-idle core.
 	 */
-	if (scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+	if (scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+	{
 		cpu = prev_cpu;
 		goto out_put_cpumask;
 	}
@@ -518,7 +624,8 @@ static s32 pick_idle_cpu(const struct task_struct *p, s32 prev_cpu)
 	 * Search for any idle CPU in the primary domain that shares the same
 	 * L2 cache.
 	 */
-	if (l2_mask) {
+	if (l2_mask)
+	{
 		cpu = scx_bpf_pick_idle_cpu(cast_mask(l2_mask), 0);
 		if (cpu >= 0)
 			goto out_put_cpumask;
@@ -528,7 +635,8 @@ static s32 pick_idle_cpu(const struct task_struct *p, s32 prev_cpu)
 	 * Search for any idle CPU in the primary domain that shares the same
 	 * L3 cache.
 	 */
-	if (l3_mask) {
+	if (l3_mask)
+	{
 		cpu = scx_bpf_pick_idle_cpu(cast_mask(l3_mask), 0);
 		if (cpu >= 0)
 			goto out_put_cpumask;
@@ -560,7 +668,8 @@ out_put_cpumask:
  */
 static void kick_task_cpu(const struct task_struct *p, s32 cpu)
 {
-	if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+	if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+	{
 		/*
 		 * Kick the target CPU anyway, since it may be locked and
 		 * needs to go back to idle to reset its state.
@@ -596,9 +705,10 @@ static void dispatch_task(const struct dispatched_task_ctx *task)
 	 * Dispatch task to the shared DSQ if the user-space scheduler
 	 * didn't select any specific target CPU.
 	 */
-	if (task->cpu == RL_CPU_ANY) {
+	if (task->cpu == RL_CPU_ANY)
+	{
 		scx_bpf_dsq_insert_vtime(p, SHARED_DSQ,
-					 task->slice_ns, task->vtime, task->flags);
+								 task->slice_ns, task->vtime, task->flags);
 		kick_task_cpu(p, prev_cpu);
 
 		goto out_release;
@@ -609,9 +719,10 @@ static void dispatch_task(const struct dispatched_task_ctx *task)
 	 * valid, dispatch it to the SHARED_DSQ, independently on what the
 	 * user-space scheduler has decided.
 	 */
-	if (!bpf_cpumask_test_cpu(task->cpu, p->cpus_ptr)) {
+	if (!bpf_cpumask_test_cpu(task->cpu, p->cpus_ptr))
+	{
 		scx_bpf_dsq_insert_vtime(p, SHARED_DSQ,
-					 task->slice_ns, task->vtime, task->flags);
+								 task->slice_ns, task->vtime, task->flags);
 		__sync_fetch_and_add(&nr_bounce_dispatches, 1);
 		kick_task_cpu(p, prev_cpu);
 
@@ -623,7 +734,7 @@ static void dispatch_task(const struct dispatched_task_ctx *task)
 	 * scheduler.
 	 */
 	scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(task->cpu),
-				 task->slice_ns, task->vtime, task->flags);
+							 task->slice_ns, task->vtime, task->flags);
 	__sync_fetch_and_add(&nr_user_dispatches, 1);
 
 	/*
@@ -635,7 +746,8 @@ static void dispatch_task(const struct dispatched_task_ctx *task)
 	 * since the task will be re-enqueued by the core sched-ext code,
 	 * potentially selecting a different CPU.
 	 */
-	if (!bpf_cpumask_test_cpu(task->cpu, p->cpus_ptr)) {
+	if (!bpf_cpumask_test_cpu(task->cpu, p->cpus_ptr))
+	{
 		scx_bpf_dispatch_cancel();
 		__sync_fetch_and_add(&nr_cancel_dispatches, 1);
 
@@ -666,7 +778,7 @@ static bool is_wake_sync(u64 wake_flags)
  * return a negative value otherwise.
  */
 static s32 try_direct_dispatch(struct task_struct *p,
-			       s32 prev_cpu, u64 enq_flags, bool *dispatched)
+							   s32 prev_cpu, u64 enq_flags, bool *dispatched)
 {
 	s32 cpu;
 
@@ -691,7 +803,8 @@ static s32 try_direct_dispatch(struct task_struct *p,
 	 * If we picked an invalid CPU for the task, give up and ignore
 	 * direct dispatch.
 	 */
-	if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+	if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+	{
 		/*
 		 * We selected a CPU that the task cannot run on, which
 		 * causes it to become idle-locked, so it can't be chosen
@@ -714,9 +827,10 @@ static s32 try_direct_dispatch(struct task_struct *p,
 	 * otherwise we may risk to starve the tasks waiting in the
 	 * SHARED_DSQ.
 	 */
-	if (!scx_bpf_dsq_nr_queued(SHARED_DSQ) && !scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu))) {
+	if (!scx_bpf_dsq_nr_queued(SHARED_DSQ) && !scx_bpf_dsq_nr_queued(cpu_to_dsq(cpu)))
+	{
 		scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(cpu),
-					 SCX_SLICE_DFL, p->scx.dsq_vtime, enq_flags);
+								 SCX_SLICE_DFL, p->scx.dsq_vtime, enq_flags);
 		__sync_fetch_and_add(&nr_kernel_dispatches, 1);
 		*dispatched = true;
 	}
@@ -725,7 +839,7 @@ static s32 try_direct_dispatch(struct task_struct *p,
 }
 
 s32 BPF_STRUCT_OPS(rustland_select_cpu, struct task_struct *p, s32 prev_cpu,
-		   u64 wake_flags)
+				   u64 wake_flags)
 {
 	bool dispatched = false;
 	s32 cpu;
@@ -746,7 +860,6 @@ s32 BPF_STRUCT_OPS(rustland_select_cpu, struct task_struct *p, s32 prev_cpu,
 	 * prioritize the waker's CPU.
 	 */
 	return is_wake_sync(wake_flags) ? bpf_get_smp_processor_id() : prev_cpu;
-
 }
 
 /*
@@ -777,7 +890,7 @@ int rs_select_cpu(struct task_cpu_arg *input)
  * scheduler.
  */
 static void get_task_info(struct queued_task_ctx *task,
-			  const struct task_struct *p, u64 enq_flags)
+						  const struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx *tctx = try_lookup_task_ctx(p);
 
@@ -834,10 +947,11 @@ void BPF_STRUCT_OPS(rustland_enqueue, struct task_struct *p, u64 enq_flags)
 	 * potentially stall the entire system if they are blocked for too long
 	 * (i.e., ksoftirqd/N, rcuop/N, etc.).
 	 */
-	if ((is_kthread(p) && p->nr_cpus_allowed == 1) || is_kswapd(p) || is_khugepaged(p)) {
+	if ((is_kthread(p) && p->nr_cpus_allowed == 1) || is_kswapd(p) || is_khugepaged(p))
+	{
 		cpu = scx_bpf_task_cpu(p);
-                scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(cpu),
-					 SCX_SLICE_DFL, p->scx.dsq_vtime, enq_flags);
+		scx_bpf_dsq_insert_vtime(p, cpu_to_dsq(cpu),
+								 SCX_SLICE_DFL, p->scx.dsq_vtime, enq_flags);
 		__sync_fetch_and_add(&nr_kernel_dispatches, 1);
 		return;
 	}
@@ -846,11 +960,13 @@ void BPF_STRUCT_OPS(rustland_enqueue, struct task_struct *p, u64 enq_flags)
 	 * Give the task a chance to be directly dispatched if
 	 * ops.select_cpu() was skipped.
 	 */
-	if (builtin_idle && is_queued_wakeup(p, enq_flags)) {
+	if (builtin_idle && is_queued_wakeup(p, enq_flags))
+	{
 		bool dispatched = false;
 
 		cpu = try_direct_dispatch(p, scx_bpf_task_cpu(p), enq_flags, &dispatched);
-		if (dispatched) {
+		if (dispatched)
+		{
 			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 			return;
 		}
@@ -865,7 +981,8 @@ void BPF_STRUCT_OPS(rustland_enqueue, struct task_struct *p, u64 enq_flags)
 	 * available in this case).
 	 */
 	task = bpf_ringbuf_reserve(&queued, sizeof(*task), 0);
-	if (!task) {
+	if (!task)
+	{
 		sched_congested(p);
 		scx_bpf_dsq_insert_vtime(p, SHARED_DSQ, SCX_SLICE_DFL, p->scx.dsq_vtime, enq_flags);
 		__sync_fetch_and_add(&nr_kernel_dispatches, 1);
@@ -891,7 +1008,8 @@ static void dispatch_user_scheduler(void)
 	struct task_struct *p;
 
 	p = bpf_task_from_pid(usersched_pid);
-	if (!p) {
+	if (!p)
+	{
 		scx_bpf_error("Failed to find usersched task %d", usersched_pid);
 		return;
 	}
@@ -973,7 +1091,8 @@ void BPF_STRUCT_OPS(rustland_dispatch, s32 cpu, struct task_struct *prev)
 	 * If there are still pending task, notify the user-space scheduler
 	 * and prevent the CPU from going idle.
 	 */
-	if (usersched_has_pending_tasks()) {
+	if (usersched_has_pending_tasks())
+	{
 		set_usersched_needed();
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 		return;
@@ -1010,7 +1129,8 @@ void BPF_STRUCT_OPS(rustland_running, struct task_struct *p)
 	s32 cpu = scx_bpf_task_cpu(p);
 	struct task_ctx *tctx;
 
-	if (is_usersched_task(p)) {
+	if (is_usersched_task(p))
+	{
 		usersched_last_run_at = scx_bpf_now();
 		return;
 	}
@@ -1064,12 +1184,115 @@ void BPF_STRUCT_OPS(rustland_stopping, struct task_struct *p, bool runnable)
 	tctx->exec_runtime += now - tctx->start_ts;
 }
 
+static __always_inline bool is_scx_task(const struct task_struct *p)
+{
+	u64 state = (p->scx.flags & SCX_TASK_STATE_MASK) >> SCX_TASK_STATE_SHIFT;
+	return state == SCX_TASK_ENABLED;
+}
+
+SEC("tp_btf/sched_switch")
+int BPF_PROG(handle_sched_switch, bool preempt, struct task_struct *prev, struct task_struct *next, u64 prev_state)
+{
+	// Skip user-space scheduler task
+	if (is_usersched_task(prev) || is_usersched_task(next))
+		return 0;
+
+	if (is_scx_task(prev))
+	{
+		s32 cpu = scx_bpf_task_cpu(prev);
+		bpf_printk("Storing data for task: pid=%d cpu=%d", prev->pid, cpu);
+
+		__u32 pid = (__u32)BPF_CORE_READ(prev, pid);
+
+		// Read counters for this cpu
+		struct bpf_perf_event_value instr_cur = {};
+		struct bpf_perf_event_value cycles_cur = {};
+
+		if (bpf_perf_event_read_value(&instr_events, cpu, &instr_cur, sizeof(instr_cur)))
+		{
+			goto out_prev;
+		}
+
+		if (bpf_perf_event_read_value(&cycles_events, cpu, &cycles_cur, sizeof(cycles_cur)))
+		{
+			goto out_prev;
+		}
+
+		// Look up snapshots to calculate deltas
+		__u64 *instr_prev_val;
+		__u64 *cycles_prev_val;
+
+		instr_prev_val = bpf_map_lookup_elem(&prev_instr, &pid);
+		cycles_prev_val = bpf_map_lookup_elem(&prev_cycles, &pid);
+
+		if (instr_prev_val && cycles_prev_val)
+		{
+			// Compute deltas
+			__u64 instr_delta = instr_cur.counter - *instr_prev_val;
+			__u64 cycles_delta = cycles_cur.counter - *cycles_prev_val;
+
+			// Store deltas
+			bpf_map_update_elem(&stored_instr, &pid, &instr_delta, BPF_ANY);
+			bpf_map_update_elem(&stored_cycles, &pid, &cycles_delta, BPF_ANY);
+
+			// Remove previous snapshots
+			bpf_map_delete_elem(&prev_instr, &pid);
+			bpf_map_delete_elem(&prev_cycles, &pid);
+
+			// Handle accumulated time
+			u64 now = scx_bpf_now();
+			__u64 *time_prev_val = bpf_map_lookup_elem(&prev_time, &pid);
+			if (time_prev_val)
+			{
+				__u64 time_delta = now - *time_prev_val;
+				bpf_map_update_elem(&accumulated_time, &pid, &time_delta, BPF_ANY);
+				bpf_map_delete_elem(&prev_time, &pid);
+			}
+		}
+	}
+
+out_prev:
+	// Handle next: tasks that starts to get scheduled in
+	if (is_scx_task(next))
+	{
+		s32 cpu = scx_bpf_task_cpu(next);
+		bpf_printk("Start recording for task: pid=%d cpu=%d", next->pid, cpu);
+
+		__u32 pid = (__u32)BPF_CORE_READ(next, pid);
+
+		// Capture current counters
+		struct bpf_perf_event_value instr_cur = {};
+		struct bpf_perf_event_value cycles_cur = {};
+
+		if (bpf_perf_event_read_value(&instr_events, cpu, &instr_cur, sizeof(instr_cur)))
+		{
+			return 0;
+		}
+		__u64 instr_snapshot = (__u64)instr_cur.counter;
+
+		if (bpf_perf_event_read_value(&cycles_events, cpu, &cycles_cur, sizeof(cycles_cur)))
+		{
+			return 0;
+		}
+		__u64 cycles_snapshot = (__u64)cycles_cur.counter;
+
+		u64 now = scx_bpf_now();
+
+		/* store start snapshots keyed by pid */
+		bpf_map_update_elem(&prev_instr, &pid, &instr_snapshot, BPF_ANY);
+		bpf_map_update_elem(&prev_cycles, &pid, &cycles_snapshot, BPF_ANY);
+		bpf_map_update_elem(&prev_time, &pid, &now, BPF_ANY);
+	}
+
+	return 0;
+}
+
 /*
  * A CPU is taken away from the scheduler, preempting the current task by
  * another one running in a higher priority sched_class.
  */
 void BPF_STRUCT_OPS(rustland_cpu_release, s32 cpu,
-				struct scx_cpu_release_args *args)
+					struct scx_cpu_release_args *args)
 {
 	struct task_struct *p = args->task;
 	/*
@@ -1097,13 +1320,13 @@ void BPF_STRUCT_OPS(rustland_enable, struct task_struct *p)
  * function is allowed to block, so it can be used to preallocate memory).
  */
 s32 BPF_STRUCT_OPS(rustland_init_task, struct task_struct *p,
-		   struct scx_init_task_args *args)
+				   struct scx_init_task_args *args)
 {
 	struct task_ctx *tctx;
 	struct bpf_cpumask *cpumask;
 
 	tctx = bpf_task_storage_get(&task_ctx_stor, p, 0,
-				    BPF_LOCAL_STORAGE_GET_F_CREATE);
+								BPF_LOCAL_STORAGE_GET_F_CREATE);
 	if (!tctx)
 		return -ENOMEM;
 
@@ -1148,10 +1371,12 @@ static int usersched_timer_fn(void *map, int *key, struct bpf_timer *timer)
 	 * Trigger the user-space scheduler if it has been inactive for
 	 * more than USERSCHED_TIMER_NS.
 	 */
-	if (time_delta(scx_bpf_now(), usersched_last_run_at) >= USERSCHED_TIMER_NS) {
+	if (time_delta(scx_bpf_now(), usersched_last_run_at) >= USERSCHED_TIMER_NS)
+	{
 		bpf_rcu_read_lock();
 		p = bpf_task_from_pid(usersched_pid);
-		if (p) {
+		if (p)
+		{
 			s32 cpu;
 
 			set_usersched_needed();
@@ -1181,7 +1406,8 @@ static int usersched_timer_init(void)
 	int err;
 
 	timer = bpf_map_lookup_elem(&usersched_timer, &key);
-	if (!timer) {
+	if (!timer)
+	{
 		scx_bpf_error("Failed to lookup scheduler timer");
 		return -ESRCH;
 	}
@@ -1204,7 +1430,8 @@ static s32 get_nr_online_cpus(void)
 
 	online_cpumask = scx_bpf_get_online_cpumask();
 
-	bpf_for(i, 0, nr_cpu_ids) {
+	bpf_for(i, 0, nr_cpu_ids)
+	{
 		if (!bpf_cpumask_test_cpu(i, online_cpumask))
 			continue;
 		cpus++;
@@ -1233,25 +1460,29 @@ static int dsq_init(void)
 	nr_online_cpus = get_nr_online_cpus();
 
 	/* Create per-CPU DSQs */
-	bpf_for(cpu, 0, nr_cpu_ids) {
+	bpf_for(cpu, 0, nr_cpu_ids)
+	{
 		err = scx_bpf_create_dsq(cpu_to_dsq(cpu), -1);
-		if (err) {
+		if (err)
+		{
 			scx_bpf_error("failed to create pcpu DSQ %d: %d",
-				      cpu, err);
+						  cpu, err);
 			return err;
 		}
 	}
 
 	/* Create the global shared DSQ */
 	err = scx_bpf_create_dsq(SHARED_DSQ, -1);
-	if (err) {
+	if (err)
+	{
 		scx_bpf_error("failed to create shared DSQ: %d", err);
 		return err;
 	}
 
 	/* Create the scheduler's DSQ */
 	err = scx_bpf_create_dsq(SCHED_DSQ, -1);
-	if (err) {
+	if (err)
+	{
 		scx_bpf_error("failed to create scheduler DSQ: %d", err);
 		return err;
 	}
@@ -1294,7 +1525,8 @@ int enable_sibling_cpu(struct domain_arg *input)
 		return -ENOENT;
 
 	/* Make sure the target CPU mask is initialized */
-	switch (input->lvl_id) {
+	switch (input->lvl_id)
+	{
 	case 2:
 		pmask = &cctx->l2_cpumask;
 		break;
@@ -1353,17 +1585,17 @@ void BPF_STRUCT_OPS(rustland_exit, struct scx_exit_info *ei)
  * Scheduling class declaration.
  */
 SCX_OPS_DEFINE(rustland,
-	       .select_cpu		= (void *)rustland_select_cpu,
-	       .enqueue			= (void *)rustland_enqueue,
-	       .dispatch		= (void *)rustland_dispatch,
-	       .runnable		= (void *)rustland_runnable,
-	       .running			= (void *)rustland_running,
-	       .stopping		= (void *)rustland_stopping,
-	       .cpu_release		= (void *)rustland_cpu_release,
-	       .enable			= (void *)rustland_enable,
-	       .init_task		= (void *)rustland_init_task,
-	       .init			= (void *)rustland_init,
-	       .exit			= (void *)rustland_exit,
-	       .timeout_ms		= 5000,
-	       .dispatch_max_batch	= MAX_DISPATCH_SLOT,
-	       .name			= "rustland");
+			   .select_cpu = (void *)rustland_select_cpu,
+			   .enqueue = (void *)rustland_enqueue,
+			   .dispatch = (void *)rustland_dispatch,
+			   .runnable = (void *)rustland_runnable,
+			   .running = (void *)rustland_running,
+			   .stopping = (void *)rustland_stopping,
+			   .cpu_release = (void *)rustland_cpu_release,
+			   .enable = (void *)rustland_enable,
+			   .init_task = (void *)rustland_init_task,
+			   .init = (void *)rustland_init,
+			   .exit = (void *)rustland_exit,
+			   .timeout_ms = 5000,
+			   .dispatch_max_batch = MAX_DISPATCH_SLOT,
+			   .name = "rustland");
