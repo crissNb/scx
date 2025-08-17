@@ -575,7 +575,8 @@ impl<'cb> BpfScheduler<'cb> {
     }
 
     // Get IPC statistics for a specific PID.
-    pub fn get_ipc_by_pid(&mut self, pid: i32) -> Result<f64> {
+    #[allow(static_mut_refs)]
+    pub fn get_ipc_by_pid(&mut self, pid: u32) -> Result<f64> {
         let pid_key = (pid as u32).to_ne_bytes();
 
         // Read pid metric
@@ -591,22 +592,23 @@ impl<'cb> BpfScheduler<'cb> {
                 pid_metric_value
             }
             None => {
-                return Err(anyhow!("Failed to read PID metric"));
+                return Err(anyhow!("Failed to read PID metric for PID: {}", pid));
             }
         };
 
         // Validate accumulated time is reasonable
-        if pid_metric_value.duration > MAX_SLICE_NS || pid_metric_value.duration < 1000 {
+        if pid_metric.duration > MAX_SLICE_NS || pid_metric.duration < 1000 {
             return Ok(0.0);
         }
 
-        if pid_metric_value.instr == 0 || pid_metric_value.cycles == 0 {
+        if pid_metric.instr == 0 || pid_metric.cycles == 0 {
             return Ok(0.0);
         }
 
-        Ok(pid_metric_value.instr as f64 / pid_metric_value.cycles as f64)
+        Ok(pid_metric.instr as f64 / pid_metric.cycles as f64)
     }
 
+    #[allow(static_mut_refs)]
     pub fn get_freq_by_cpu(&mut self, cpu: i32) -> Result<f64> {
         let pid = self.find_pid_by_cpu(cpu)?;
 
@@ -629,17 +631,18 @@ impl<'cb> BpfScheduler<'cb> {
         };
 
         // Validate accumulated time is reasonable
-        if pid_metric_value.duration > MAX_SLICE_NS || pid_metric_value.duration < 1000 {
+        if pid_metric.duration > MAX_SLICE_NS || pid_metric.duration < 1000 {
             return Ok(0.0);
         }
 
-        if pid_metric_value.cycles == 0 || pid_metric_value.clock == 0 {
+        if pid_metric.cycles == 0 || pid_metric.clock == 0 {
             return Ok(0.0);
         }
 
-        Ok(1.0 as f64 / pid_metric_value.clock as f64)
+        Ok(1.0 as f64 / pid_metric.clock as f64)
     }
 
+    #[allow(static_mut_refs)]
     pub fn get_ipc_by_cpu(&mut self, cpu: i32) -> Result<f64> {
         let pid = self.find_pid_by_cpu(cpu)?;
         self.get_ipc_by_pid(pid)
@@ -662,11 +665,11 @@ impl<'cb> BpfScheduler<'cb> {
                     .map_err(|_| anyhow!("Invalid accumulated_time value length"))?,
             ),
             None => {
-                return 0;
+                return Err(anyhow!("Failed to find PID for CPU: {}", cpu));
             }
         };
 
-        return pid;
+        return Ok(pid);
     }
 
     // Set scheduling class for the scheduler itself to SCHED_EXT
@@ -692,6 +695,7 @@ impl<'cb> BpfScheduler<'cb> {
     }
 
     // Pick an idle CPU for the target PID.
+    #[allow(static_mut_refs)]
     pub fn select_cpu(&mut self, pid: i32, cpu: i32, flags: u64) -> i32 {
         let prog = &mut self.skel.progs.rs_select_cpu;
         let mut args = task_cpu_arg {
