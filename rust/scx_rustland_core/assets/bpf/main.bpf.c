@@ -244,6 +244,32 @@ struct
 	__type(value, struct task_ctx);
 } task_ctx_stor SEC(".maps");
 
+/**
+ * Per PID metrics within slice
+ */
+struct pid_metric
+{
+	/*
+	 * Instructions executed within slice.
+	 */
+	u64 instr;
+
+	/*
+	 * Cycles executed within slice.
+	 */
+	u64 cycles;
+
+	/*
+	 * Clock cycles executed within slice.
+	 */
+	u64 clock;
+
+	/*
+	 * Actual time in nanoseconds that took to execute the slice.
+	 */
+	u64 duration;
+};
+
 /* perf-event array maps:
  * Userspace must open perf events (instructions and cycles) and
  * populate these maps with the FDs per-cpu.
@@ -264,69 +290,50 @@ struct
 	__uint(max_entries, 0);
 } cycles_events SEC(".maps");
 
+struct
+{
+	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
+	__uint(key_size, sizeof(int));
+	__uint(value_size, sizeof(__u32));
+	__uint(max_entries, 0);
+} clock_events SEC(".maps");
+
 /* Store the "start" snapshot for a PID (when it gets scheduled in).
  * Key: pid (u32)
- * Value: struct bpf_perf_event_value (one map for instr, one for cycles)
+ * Value: struct pid_metric
  */
 struct
 {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, __u32);
-	__type(value, struct bpf_perf_event_value);
+	__type(value, struct pid_metric);
 	__uint(max_entries, 10240);
-} prev_instr SEC(".maps");
-
-struct
-{
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__type(key, __u32);
-	__type(value, struct bpf_perf_event_value);
-	__uint(max_entries, 10240);
-} prev_cycles SEC(".maps");
+} prev_pid_metric SEC(".maps");
 
 /* Store the "end" snapshot for a PID (when it gets scheduled out).
  * Key: pid (u32)
- * Value: struct bpf_perf_event_value
+ * Value: struct pid_metric
  */
 struct
 {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__type(key, __u32);
-	__type(value, struct bpf_perf_event_value);
+	__type(value, struct pid_metric);
 	__uint(max_entries, 10240);
-} stored_instr SEC(".maps");
+} stored_pid_metric SEC(".maps");
 
-struct
-{
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__type(key, __u32);
-	__type(value, struct bpf_perf_event_value);
-	__uint(max_entries, 10240);
-} stored_cycles SEC(".maps");
-
-/* Store the "start" time for a PID (when it gets scheduled in).
- * Key: pid (u32)
- * Value: __u64 (timestamp)
+/*
+ * Store what PID is currently running on each CPU.
+ * Key: cpu (u32)
+ * Value: pid (u32)
  */
 struct
 {
-	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__type(key, __u32);
-	__type(value, __u64);
-	__uint(max_entries, 10240);
-} prev_time SEC(".maps");
-
-/* Store the accumulated time for a PID.
- * Key: pid (u32)
- * Value: __u64 (accumulated time)
- */
-struct
-{
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__type(key, __u32);
-	__type(value, __u64);
-	__uint(max_entries, 10240);
-} accumulated_time SEC(".maps");
+	__type(value, __u32);
+	__uint(max_entries, MAX_CPUS);
+} current_pid_cpu SEC(".maps");
 
 /*
  * Return a local task context from a generic task or NULL if the context
@@ -1197,16 +1204,21 @@ int BPF_PROG(handle_sched_switch, bool preempt, struct task_struct *prev, struct
 	if (is_usersched_task(prev) || is_usersched_task(next))
 		return 0;
 
+	// Get CPU for current context
+	s32 cpu = scx_bpf_task_cpu(prev);
+	__u32 cpu_key = (__u32)cpu;
+
+	// Handle prev task: task that is being scheduled out
 	if (is_scx_task(prev))
 	{
-		s32 cpu = scx_bpf_task_cpu(prev);
 		bpf_printk("Storing data for task: pid=%d cpu=%d", prev->pid, cpu);
 
 		__u32 pid = (__u32)BPF_CORE_READ(prev, pid);
 
-		// Read counters for this cpu
+		// Read current counters for this cpu
 		struct bpf_perf_event_value instr_cur = {};
 		struct bpf_perf_event_value cycles_cur = {};
+		struct bpf_perf_event_value clock_cur = {};
 
 		if (bpf_perf_event_read_value(&instr_events, cpu, &instr_cur, sizeof(instr_cur)))
 		{
@@ -1218,70 +1230,80 @@ int BPF_PROG(handle_sched_switch, bool preempt, struct task_struct *prev, struct
 			goto out_prev;
 		}
 
-		// Look up snapshots to calculate deltas
-		__u64 *instr_prev_val;
-		__u64 *cycles_prev_val;
-
-		instr_prev_val = bpf_map_lookup_elem(&prev_instr, &pid);
-		cycles_prev_val = bpf_map_lookup_elem(&prev_cycles, &pid);
-
-		if (instr_prev_val && cycles_prev_val)
+		if (bpf_perf_event_read_value(&clock_events, cpu, &clock_cur, sizeof(clock_cur)))
 		{
-			// Compute deltas
-			__u64 instr_delta = instr_cur.counter - *instr_prev_val;
-			__u64 cycles_delta = cycles_cur.counter - *cycles_prev_val;
+			goto out_prev;
+		}
 
-			// Store deltas
-			bpf_map_update_elem(&stored_instr, &pid, &instr_delta, BPF_ANY);
-			bpf_map_update_elem(&stored_cycles, &pid, &cycles_delta, BPF_ANY);
+		// Look up previous snapshots to calculate deltas
+		struct pid_metric *prev_metric = bpf_map_lookup_elem(&prev_pid_metric, &pid);
 
-			// Remove previous snapshots
-			bpf_map_delete_elem(&prev_instr, &pid);
-			bpf_map_delete_elem(&prev_cycles, &pid);
+		if (prev_metric)
+		{
+			// Create stored metric with deltas
+			struct pid_metric stored_metric = {};
 
-			// Handle accumulated time
+			// Compute deltas for each metric
+			stored_metric.instr = instr_cur.counter - prev_metric->instr;
+			stored_metric.cycles = cycles_cur.counter - prev_metric->cycles;
+			stored_metric.clock = clock_cur.counter - prev_metric->clock;
+
+			// Calculate duration in nanoseconds
 			u64 now = scx_bpf_now();
-			__u64 *time_prev_val = bpf_map_lookup_elem(&prev_time, &pid);
-			if (time_prev_val)
-			{
-				__u64 time_delta = now - *time_prev_val;
-				bpf_map_update_elem(&accumulated_time, &pid, &time_delta, BPF_ANY);
-				bpf_map_delete_elem(&prev_time, &pid);
-			}
+			stored_metric.duration = now - prev_metric->duration;
+
+			// Store the computed deltas
+			bpf_map_update_elem(&stored_pid_metric, &pid, &stored_metric, BPF_ANY);
+
+			// Remove the previous snapshot since we've processed it
+			bpf_map_delete_elem(&prev_pid_metric, &pid);
 		}
 	}
 
 out_prev:
-	// Handle next: tasks that starts to get scheduled in
+	// Handle next task: task that is being scheduled in
 	if (is_scx_task(next))
 	{
-		s32 cpu = scx_bpf_task_cpu(next);
 		bpf_printk("Start recording for task: pid=%d cpu=%d", next->pid, cpu);
 
 		__u32 pid = (__u32)BPF_CORE_READ(next, pid);
 
-		// Capture current counters
-		struct bpf_perf_event_value instr_cur = {};
-		struct bpf_perf_event_value cycles_cur = {};
+		// Update current_pid_cpu map to track what PID is running on this CPU
+		bpf_map_update_elem(&current_pid_cpu, &cpu_key, &pid, BPF_ANY);
 
-		if (bpf_perf_event_read_value(&instr_events, cpu, &instr_cur, sizeof(instr_cur)))
+		// Capture current perf counter values as starting snapshots
+		struct pid_metric start_metric = {};
+
+		if (bpf_perf_event_read_value(&instr_events, cpu, &start_metric.instr, sizeof(start_metric.instr)))
 		{
-			return 0;
+			goto out_next;
 		}
-		__u64 instr_snapshot = (__u64)instr_cur.counter;
 
-		if (bpf_perf_event_read_value(&cycles_events, cpu, &cycles_cur, sizeof(cycles_cur)))
+		if (bpf_perf_event_read_value(&cycles_events, cpu, &start_metric.cycles, sizeof(start_metric.cycles)))
 		{
-			return 0;
+			goto out_next;
 		}
-		__u64 cycles_snapshot = (__u64)cycles_cur.counter;
 
-		u64 now = scx_bpf_now();
+		if (bpf_perf_event_read_value(&clock_events, cpu, &start_metric.clock, sizeof(start_metric.clock)))
+		{
+			goto out_next;
+		}
 
-		/* store start snapshots keyed by pid */
-		bpf_map_update_elem(&prev_instr, &pid, &instr_snapshot, BPF_ANY);
-		bpf_map_update_elem(&prev_cycles, &pid, &cycles_snapshot, BPF_ANY);
-		bpf_map_update_elem(&prev_time, &pid, &now, BPF_ANY);
+		// Store timestamp as starting point for duration calculation
+		start_metric.duration = scx_bpf_now();
+
+		// Store the starting snapshots keyed by pid
+		bpf_map_update_elem(&prev_pid_metric, &pid, &start_metric, BPF_ANY);
+
+		goto out_next;
+	}
+
+out_next:
+	// If no next task is an SCX task, set CPU as idle (PID 0)
+	if (!is_scx_task(next))
+	{
+		__u32 idle_pid = 0;
+		bpf_map_update_elem(&current_pid_cpu, &cpu_key, &idle_pid, BPF_ANY);
 	}
 
 	return 0;
