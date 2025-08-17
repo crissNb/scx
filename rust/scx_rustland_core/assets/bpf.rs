@@ -576,8 +576,12 @@ impl<'cb> BpfScheduler<'cb> {
 
     // Get IPC statistics for a specific PID.
     #[allow(static_mut_refs)]
-    pub fn get_ipc_by_pid(&mut self, pid: u32) -> Result<f64> {
-        let pid_key = (pid as u32).to_ne_bytes();
+    pub fn get_perf_data_by_pid(&mut self, pid: u32) -> Result<PIDMetric> {
+        if pid == 0 {
+            return Err(anyhow!("Invalid PID: 0"));
+        }
+
+        let pid_key = (pid).to_ne_bytes();
 
         // Read pid metric
         let pid_metric = match self
@@ -596,56 +600,13 @@ impl<'cb> BpfScheduler<'cb> {
             }
         };
 
-        // Validate accumulated time is reasonable
-        if pid_metric.duration > MAX_SLICE_NS || pid_metric.duration < 1000 {
-            return Ok(0.0);
-        }
-
-        if pid_metric.instr == 0 || pid_metric.cycles == 0 {
-            return Ok(0.0);
-        }
-
-        Ok(pid_metric.instr as f64 / pid_metric.cycles as f64)
+        Ok(pid_metric)
     }
 
     #[allow(static_mut_refs)]
-    pub fn get_freq_by_cpu(&mut self, cpu: i32) -> Result<f64> {
+    pub fn get_perf_data_by_cpu(&mut self, cpu: i32) -> Result<PIDMetric> {
         let pid = self.find_pid_by_cpu(cpu)?;
-
-        let pid_key = (pid as u32).to_ne_bytes();
-
-        let pid_metric = match self
-            .skel
-            .maps
-            .stored_pid_metric
-            .lookup(&pid_key, MapFlags::ANY)?
-        {
-            Some(pid_metric_bytes) => {
-                let pid_metric_value: PIDMetric =
-                    unsafe { std::ptr::read(pid_metric_bytes.as_ptr() as *const PIDMetric) };
-                pid_metric_value
-            }
-            None => {
-                return Err(anyhow!("Failed to read PID metric"));
-            }
-        };
-
-        // Validate accumulated time is reasonable
-        if pid_metric.duration > MAX_SLICE_NS || pid_metric.duration < 1000 {
-            return Ok(0.0);
-        }
-
-        if pid_metric.cycles == 0 || pid_metric.clock == 0 {
-            return Ok(0.0);
-        }
-
-        Ok(1.0 as f64 / pid_metric.clock as f64)
-    }
-
-    #[allow(static_mut_refs)]
-    pub fn get_ipc_by_cpu(&mut self, cpu: i32) -> Result<f64> {
-        let pid = self.find_pid_by_cpu(cpu)?;
-        self.get_ipc_by_pid(pid)
+        self.get_perf_data_by_pid(pid)
     }
 
     fn find_pid_by_cpu(&mut self, cpu: i32) -> Result<u32> {

@@ -1273,21 +1273,29 @@ out_prev:
 
 		// Capture current perf counter values as starting snapshots
 		struct pid_metric start_metric = {};
+		struct bpf_perf_event_value instr_cur = {};
+		struct bpf_perf_event_value cycles_cur = {};
+		struct bpf_perf_event_value clock_cur = {};
 
-		if (bpf_perf_event_read_value(&instr_events, cpu, &start_metric.instr, sizeof(start_metric.instr)))
+		if (bpf_perf_event_read_value(&instr_events, cpu, &instr_cur, sizeof(instr_cur)))
 		{
 			goto out_next;
 		}
 
-		if (bpf_perf_event_read_value(&cycles_events, cpu, &start_metric.cycles, sizeof(start_metric.cycles)))
+		if (bpf_perf_event_read_value(&cycles_events, cpu, &cycles_cur, sizeof(cycles_cur)))
 		{
 			goto out_next;
 		}
 
-		if (bpf_perf_event_read_value(&clock_events, cpu, &start_metric.clock, sizeof(start_metric.clock)))
+		if (bpf_perf_event_read_value(&clock_events, cpu, &clock_cur, sizeof(clock_cur)))
 		{
 			goto out_next;
 		}
+
+		// Store them in start_metric
+		start_metric.instr = instr_cur.counter;
+		start_metric.cycles = cycles_cur.counter;
+		start_metric.clock = clock_cur.counter;
 
 		// Store timestamp as starting point for duration calculation
 		start_metric.duration = scx_bpf_now();
